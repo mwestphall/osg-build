@@ -187,7 +187,7 @@ def fetch_github_source(repo, tag, hash=None, ops=None, **kw):
 
 
 def fetch_git_source(url, tag, hash=None, ops=None,
-        name=None, spec=None, tarball=None, prefix=None):
+        name=None, spec=None, tarball=None, prefix=None, submodules=False):
     name = name or re.sub(r'\.git$', '', os.path.basename(url))
     (_almost_required if ops.nocheck else _required)(hash, 'hash')
     spec = ops.want_spec and ("rpm/%s.spec" % name if spec is None else spec)
@@ -197,7 +197,7 @@ def fetch_git_source(url, tag, hash=None, ops=None,
     tarball = tarball or prefix + ".tar.gz"
 
     return run_with_tmp_git_dir(ops.destdir, lambda:
-        git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, ops))
+        git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, submodules, ops))
 
 
 def run_with_tmp_git_dir(destdir, call):
@@ -229,7 +229,7 @@ def unchecked_call2(*args, **kw):
     return utils.sbacktick(*args, err2out=True, **kw)[1] == 0
 
 
-def git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, ops):
+def git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, submodules, ops):
     log.info('Retrieving %s %s' % (url, tag))
     try:
         checked_call2(['git', 'init', '-q', '--bare'])
@@ -247,12 +247,20 @@ def git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, ops):
         check_git_hash(url, tag, hash, got_sha, ops.nocheck)
 
     dest_tar_gz = os.path.join(ops.destdir, tarball)
+    dest_tar = dest_tar_gz[:-len('.gz')]
     git_archive_cmd = ['git', 'archive', '--format=tar',
-                                         '--prefix=%s/' % prefix, got_sha]
-    gzip_cmd = ['gzip', '-n']
+                                         '--prefix=%s/' % prefix,
+                                         '--output=%s' % dest_tar, got_sha]
+    utils.checked_call(git_archive_cmd)
 
-    with open(dest_tar_gz, "w") as destf:
-        utils.checked_pipeline([git_archive_cmd, gzip_cmd], stdout=destf)
+    if submodules and str(submodules).lower() not in {"none", "false", "0"}:
+        utils.checked_call(['git', 'submodule', 'update', '--init', '--recursive'])
+        utils.checked_call(['git', 'submodule', 'foreach', '--recursive',
+                            'git archive --prefix=%s/$path/ --output=$sha1.tar HEAD && '
+                            'tar --concatenate --file=%s $sha1.tar && '
+                            'rm $sha1.tar' % (prefix, dest_tar)])
+
+    utils.checked_call(['gzip', '-n', dest_tar])
 
     if spec:
         spec = try_get_spec(ops.destdir, got_sha, spec)

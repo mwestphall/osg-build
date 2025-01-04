@@ -196,18 +196,11 @@ def fetch_git_source(url, tag, hash=None, ops=None,
     tarball = tarball and os.path.basename(tarball)
     tarball = tarball or prefix + ".tar.gz"
 
-    return run_with_tmp_git_dir(ops.destdir, lambda:
-        git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, submodules, ops))
-
-
-def run_with_tmp_git_dir(destdir, call):
-    git_dir = tempfile.mkdtemp(dir=destdir)
-    old_git_dir = update_env('GIT_DIR', git_dir)
-    try:
-        return call()
-    finally:
-        shutil.rmtree(git_dir)
-        update_env('GIT_DIR', old_git_dir)
+    with tempfile.TemporaryDirectory(dir=ops.destdir) as tempdir:
+        with utils.chdir(tempdir):
+            return git_archive_remote_ref(
+                url, tag, hash, prefix, tarball, spec, submodules, ops
+            )
 
 
 def update_env(key, val):
@@ -232,17 +225,12 @@ def unchecked_call2(*args, **kw):
 def git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, submodules, ops):
     log.info('Retrieving %s %s' % (url, tag))
     try:
-        checked_call2(['git', 'init', '-q', '--bare'])
-        checked_call2(['git', 'remote', 'add', 'origin', url])
-        fetchcmd = ['git', 'fetch', '-q', '--depth=1', 'origin']
-        # SL6 compat: try to fetch a tag first, else fall back to generic fetch
-        unchecked_call2(fetchcmd + ['tag', tag]) or \
-          checked_call2(fetchcmd + [tag])
+        checked_call2(['git', 'clone', '--branch', tag, url, '.'])
     except CalledProcessError as e:
         log.error("Failed to retrieve tag '%s' from repo '%s'" % (tag, url))
         raise Error(e)
 
-    got_sha = utils.checked_backtick(['git', 'rev-parse', 'FETCH_HEAD'])
+    got_sha = utils.checked_backtick(['git', 'rev-parse', 'HEAD'])
     if hash or not ops.nocheck:
         check_git_hash(url, tag, hash, got_sha, ops.nocheck)
 
@@ -260,7 +248,7 @@ def git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, submodules, op
                             'tar --concatenate --file=%s $sha1.tar && '
                             'rm $sha1.tar' % (prefix, dest_tar)])
 
-    utils.checked_call(['gzip', '-n', dest_tar])
+    utils.checked_call(['gzip', '-fn', dest_tar])
 
     if spec:
         spec = try_get_spec(ops.destdir, got_sha, spec)

@@ -25,6 +25,7 @@ Possible fields names:
     uri:      uri for file to download (type=uri)
     filename: outfile if different than uri basename (type=uri, optional)
     sha1sum:  chksum of downloaded file (type=uri/cached, optional)
+    submodules: true/false if we should include submodules in the archive (type=git/github, optional)
 
 
 Each line is associated with a source 'type':
@@ -67,6 +68,8 @@ import sys
 import urllib
 import urllib.error
 import urllib.request
+
+from typing import Optional
 
 from . import constants as C
 from .error import Error, GlobNotFoundError
@@ -187,7 +190,7 @@ def fetch_github_source(repo, tag, hash=None, ops=None, **kw):
 
 
 def fetch_git_source(url, tag, hash=None, ops=None,
-        name=None, spec=None, tarball=None, prefix=None):
+        name=None, spec=None, tarball=None, prefix=None, submodules=False):
     name = name or re.sub(r'\.git$', '', os.path.basename(url))
     (_almost_required if ops.nocheck else _required)(hash, 'hash')
     spec = ops.want_spec and ("rpm/%s.spec" % name if spec is None else spec)
@@ -196,18 +199,11 @@ def fetch_git_source(url, tag, hash=None, ops=None,
     tarball = tarball and os.path.basename(tarball)
     tarball = tarball or prefix + ".tar.gz"
 
-    return run_with_tmp_git_dir(ops.destdir, lambda:
-        git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, ops))
-
-
-def run_with_tmp_git_dir(destdir, call):
-    git_dir = tempfile.mkdtemp(dir=destdir)
-    old_git_dir = update_env('GIT_DIR', git_dir)
-    try:
-        return call()
-    finally:
-        shutil.rmtree(git_dir)
-        update_env('GIT_DIR', old_git_dir)
+    with tempfile.TemporaryDirectory(dir=ops.destdir) as tempdir:
+        with utils.chdir(tempdir):
+            return git_archive_remote_ref(
+                url, tag, hash, prefix, tarball, spec, submodules, ops
+            )
 
 
 def update_env(key, val):
@@ -229,31 +225,61 @@ def unchecked_call2(*args, **kw):
     return utils.sbacktick(*args, err2out=True, **kw)[1] == 0
 
 
-def git_archive_remote_ref(url, tag, hash, prefix, tarball, spec, ops):
+def git_archive_remote_ref(
+        url: str, tag: str, hash: Optional[str], prefix: str, tarball: str,
+        spec: Optional[str], submodules: bool, ops: FetchOptions
+):
+    """
+    Create a tarball from a git tag (or branch) using git archive, optionally with submodules.
+
+    Args:
+        url: the upstream URL of the git repo
+        tag: the tag (or branch) to create the archive from
+        hash: optional, the sha1 hash of the tag/branch, used for verification
+        prefix: the directory prefix of the files in the created tarball
+        tarball: the name of the created tarball
+        spec: optional, the path to the spec file within the git repo
+        submodules: boolean, set to true if we should fetch submodules after checking out the main repo
+        ops: other options
+
+    Returns:
+        The path to the created tarball.
+    """
     log.info('Retrieving %s %s' % (url, tag))
     try:
-        checked_call2(['git', 'init', '-q', '--bare'])
-        checked_call2(['git', 'remote', 'add', 'origin', url])
-        fetchcmd = ['git', 'fetch', '-q', '--depth=1', 'origin']
-        # SL6 compat: try to fetch a tag first, else fall back to generic fetch
-        unchecked_call2(fetchcmd + ['tag', tag]) or \
-          checked_call2(fetchcmd + [tag])
+        checked_call2(['git', 'clone', '--branch', tag, url, '.'])
     except CalledProcessError as e:
         log.error("Failed to retrieve tag '%s' from repo '%s'" % (tag, url))
         raise Error(e)
 
-    got_sha = utils.checked_backtick(['git', 'rev-parse', 'FETCH_HEAD'])
+    got_sha = utils.checked_backtick(['git', 'rev-parse', 'HEAD'])
     if hash or not ops.nocheck:
         check_git_hash(url, tag, hash, got_sha, ops.nocheck)
 
     dest_tar_gz = os.path.join(ops.destdir, tarball)
-    git_archive_cmd = ['git', 'archive', '--format=tar',
-                                         '--prefix=%s/' % prefix, got_sha]
-    gzip_cmd = ['gzip', '-n']
+    dest_tar = dest_tar_gz[:-len('.gz')]
+    # Create the initial tarball with the contents of the repo
+    utils.checked_call([
+        'git', 'archive', f'--prefix={prefix}/', f'--output={dest_tar}', got_sha
+    ])
 
-    with open(dest_tar_gz, "w") as destf:
-        utils.checked_pipeline([git_archive_cmd, gzip_cmd], stdout=destf)
+    if submodules and str(submodules).lower() not in {"none", "false", "0"}:
+        # We are asked for submodules. Pull all the submodules:
+        utils.checked_call(['git', 'submodule', 'update', '--init', '--recursive'])
+        # Create a tarball for each submodule, then append that tarball to the main tarball.
+        # The following command will be run by git for each submodule --
+        # $path and $sha1 will be substituted in by 'git submodule foreach'
+        submodule_archive_command = (
+            f'git archive --prefix={prefix}/$path/ --output=$sha1.tar HEAD && '
+            f'tar --concatenate --file={dest_tar} $sha1.tar && '
+            f'rm $sha1.tar'
+        )
+        utils.checked_call(['git', 'submodule', 'foreach', '--recursive', submodule_archive_command])
 
+    # compress the result
+    utils.checked_call(['gzip', '-fn', dest_tar])
+
+    # if we were told there is a spec file, copy it out of the repo
     if spec:
         spec = try_get_spec(ops.destdir, got_sha, spec)
 

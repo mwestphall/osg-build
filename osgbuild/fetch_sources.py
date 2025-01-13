@@ -247,7 +247,10 @@ def git_archive_remote_ref(
     """
     log.info('Retrieving %s %s' % (url, tag))
     try:
-        checked_call2(['git', 'clone', '--branch', tag, url, '.'])
+        if tag == 'HEAD':
+            checked_call2(['git', 'clone', url, '.'])
+        else:
+            checked_call2(['git', 'clone', '--branch', tag, url, '.'])
     except CalledProcessError as e:
         log.error("Failed to retrieve tag '%s' from repo '%s'" % (tag, url))
         raise Error(e)
